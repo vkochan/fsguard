@@ -1,0 +1,115 @@
+From 3a2bd872f1e18945de85c4d0965561a0d2b7ef6c Mon Sep 17 00:00:00 2001
+From: Vadim Kochan <vadim4j@gmail.com>
+Date: Sat, 1 Apr 2017 11:31:00 +0300
+Subject: [PATCH] security: fsguard: Add initial commit
+
+Signed-off-by: Vadim Kochan <vadim4j@gmail.com>
+---
+ security/Kconfig           |  1 +
+ security/Makefile          |  2 ++
+ security/fsguard/Kconfig   |  7 +++++++
+ security/fsguard/Makefile  |  2 ++
+ security/fsguard/fsguard.c | 36 ++++++++++++++++++++++++++++++++++++
+ 5 files changed, 48 insertions(+)
+ create mode 100644 security/fsguard/Kconfig
+ create mode 100644 security/fsguard/Makefile
+ create mode 100644 security/fsguard/fsguard.c
+
+diff --git a/security/Kconfig b/security/Kconfig
+index 118f454..9b1f11b 100644
+--- a/security/Kconfig
++++ b/security/Kconfig
+@@ -164,6 +164,7 @@ source security/tomoyo/Kconfig
+ source security/apparmor/Kconfig
+ source security/loadpin/Kconfig
+ source security/yama/Kconfig
++source security/fsguard/Kconfig
+ 
+ source security/integrity/Kconfig
+ 
+diff --git a/security/Makefile b/security/Makefile
+index f2d71cd..7e47a85 100644
+--- a/security/Makefile
++++ b/security/Makefile
+@@ -9,6 +9,7 @@ subdir-$(CONFIG_SECURITY_TOMOYO)        += tomoyo
+ subdir-$(CONFIG_SECURITY_APPARMOR)	+= apparmor
+ subdir-$(CONFIG_SECURITY_YAMA)		+= yama
+ subdir-$(CONFIG_SECURITY_LOADPIN)	+= loadpin
++subdir-$(CONFIG_SECURITY_FSGUARD)	+= fsguard
+ 
+ # always enable default capabilities
+ obj-y					+= commoncap.o
+@@ -25,6 +26,7 @@ obj-$(CONFIG_SECURITY_APPARMOR)		+= apparmor/
+ obj-$(CONFIG_SECURITY_YAMA)		+= yama/
+ obj-$(CONFIG_SECURITY_LOADPIN)		+= loadpin/
+ obj-$(CONFIG_CGROUP_DEVICE)		+= device_cgroup.o
++obj-$(CONFIG_SECURITY_FSGUARD)		+= fsguard/
+ 
+ # Object integrity file lists
+ subdir-$(CONFIG_INTEGRITY)		+= integrity
+diff --git a/security/fsguard/Kconfig b/security/fsguard/Kconfig
+new file mode 100644
+index 0000000..e4c519c
+--- /dev/null
++++ b/security/fsguard/Kconfig
+@@ -0,0 +1,7 @@
++config SECURITY_FSGUARD
++	bool "File System Guard Support"
++	default n
++	help
++	  This selects File System Guard module which allows to watch file
++          system integrity.
++
+diff --git a/security/fsguard/Makefile b/security/fsguard/Makefile
+new file mode 100644
+index 0000000..99844f5
+--- /dev/null
++++ b/security/fsguard/Makefile
+@@ -0,0 +1,2 @@
++obj-$(CONFIG_SECURITY_FSGUARD) += fsguard.o
++
+diff --git a/security/fsguard/fsguard.c b/security/fsguard/fsguard.c
+new file mode 100644
+index 0000000..d7dbe1e
+--- /dev/null
++++ b/security/fsguard/fsguard.c
+@@ -0,0 +1,36 @@
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/binfmts.h>
++#include <linux/lsm_hooks.h>
++
++static struct dentry *fsguard_dir;
++
++static int fsguard_bprm_check_security(struct linux_binprm *binp)
++{
++	/* pr_info("checking [%s]\n", binp->filename); */
++
++	return 0;
++}
++
++static struct security_hook_list  fsguard_security_hooks[] = {
++	LSM_HOOK_INIT(bprm_check_security, fsguard_bprm_check_security),
++};
++
++int __init fsguard_init(void)
++{
++	pr_info("init\n");
++
++	fsguard_dir = securityfs_create_dir("fsguard", NULL);
++	if (IS_ERR(fsguard_dir)) {
++		pr_err("failed to add [fsguard] dir\n");
++		return -1;
++	}
++
++	security_add_hooks(fsguard_security_hooks, ARRAY_SIZE(fsguard_security_hooks));
++
++	return 0;
++}
++ 
++MODULE_LICENSE("GPL");
+-- 
+2.12.1
+
