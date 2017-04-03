@@ -1,0 +1,710 @@
+From 38cc18dd5ede31e19dc88375900d25f809346809 Mon Sep 17 00:00:00 2001
+From: Vadim Kochan <vadim4j@gmail.com>
+Date: Mon, 3 Apr 2017 03:17:03 +0300
+Subject: [PATCH] fsguard: Initial commit
+
+Signed-off-by: Vadim Kochan <vadim4j@gmail.com>
+---
+ security/Kconfig           |   1 +
+ security/Makefile          |   2 +
+ security/fsguard/Kconfig   |   7 +
+ security/fsguard/Makefile  |   2 +
+ security/fsguard/fsguard.c | 631 +++++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 643 insertions(+)
+ create mode 100644 security/fsguard/Kconfig
+ create mode 100644 security/fsguard/Makefile
+ create mode 100644 security/fsguard/fsguard.c
+
+diff --git a/security/Kconfig b/security/Kconfig
+index 59aea7d..154c42c 100644
+--- a/security/Kconfig
++++ b/security/Kconfig
+@@ -173,6 +173,7 @@ source security/tomoyo/Kconfig
+ source security/apparmor/Kconfig
+ source security/loadpin/Kconfig
+ source security/yama/Kconfig
++source security/fsguard/Kconfig
+ 
+ source security/integrity/Kconfig
+ 
+diff --git a/security/Makefile b/security/Makefile
+index f2d71cd..7e47a85 100644
+--- a/security/Makefile
++++ b/security/Makefile
+@@ -9,6 +9,7 @@ subdir-$(CONFIG_SECURITY_TOMOYO)        += tomoyo
+ subdir-$(CONFIG_SECURITY_APPARMOR)	+= apparmor
+ subdir-$(CONFIG_SECURITY_YAMA)		+= yama
+ subdir-$(CONFIG_SECURITY_LOADPIN)	+= loadpin
++subdir-$(CONFIG_SECURITY_FSGUARD)	+= fsguard
+ 
+ # always enable default capabilities
+ obj-y					+= commoncap.o
+@@ -25,6 +26,7 @@ obj-$(CONFIG_SECURITY_APPARMOR)		+= apparmor/
+ obj-$(CONFIG_SECURITY_YAMA)		+= yama/
+ obj-$(CONFIG_SECURITY_LOADPIN)		+= loadpin/
+ obj-$(CONFIG_CGROUP_DEVICE)		+= device_cgroup.o
++obj-$(CONFIG_SECURITY_FSGUARD)		+= fsguard/
+ 
+ # Object integrity file lists
+ subdir-$(CONFIG_INTEGRITY)		+= integrity
+diff --git a/security/fsguard/Kconfig b/security/fsguard/Kconfig
+new file mode 100644
+index 0000000..e4c519c
+--- /dev/null
++++ b/security/fsguard/Kconfig
+@@ -0,0 +1,7 @@
++config SECURITY_FSGUARD
++	bool "File System Guard Support"
++	default n
++	help
++	  This selects File System Guard module which allows to watch file
++          system integrity.
++
+diff --git a/security/fsguard/Makefile b/security/fsguard/Makefile
+new file mode 100644
+index 0000000..99844f5
+--- /dev/null
++++ b/security/fsguard/Makefile
+@@ -0,0 +1,2 @@
++obj-$(CONFIG_SECURITY_FSGUARD) += fsguard.o
++
+diff --git a/security/fsguard/fsguard.c b/security/fsguard/fsguard.c
+new file mode 100644
+index 0000000..63269a8
+--- /dev/null
++++ b/security/fsguard/fsguard.c
+@@ -0,0 +1,631 @@
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/binfmts.h>
++#include <linux/lsm_hooks.h>
++#include <linux/seq_file.h>
++#include <linux/uaccess.h>
++
++#include <crypto/sha.h>
++#include <crypto/md5.h>
++#include <crypto/hash.h>
++#include <crypto/hash_info.h>
++
++static struct dentry *fs_dir;
++static struct dentry *fs_hentry;
++static struct dentry *fs_events;
++
++enum hentry_token_t {
++	HENTRY_TOK_CMD,
++	HENTRY_TOK_ALG,
++	HENTRY_TOK_HASH,
++	HENTRY_TOK_PATH,
++	HENTRY_TOK_FNAME,
++	HENTRY_TOK_END,
++};
++
++enum hentry_cmd_t {
++	HENTRY_CMD_NONE,
++	HENTRY_CMD_ADD,
++	HENTRY_CMD_DEL,
++};
++
++#define HASH_SIZE_MAX	SHA1_DIGEST_SIZE
++
++struct fsguard_event {
++	struct list_head list;
++	struct rcu_head rcu;
++	char *path;
++};
++
++struct fsguard_hentry {
++	struct list_head list;
++	struct rcu_head rcu;
++	char *path;
++	u8 *hash;
++	int alg;
++};
++
++static LIST_HEAD(hentries);
++static LIST_HEAD(events);
++
++DEFINE_MUTEX(hentry_mtx);
++DEFINE_MUTEX(evt_mtx);
++
++static void *fs_hentry_seq_start(struct seq_file *seq, loff_t *pos)
++{
++	struct fsguard_hentry *he;
++	loff_t n = *pos;
++
++	rcu_read_lock();
++	list_for_each_entry_rcu(he, &hentries, list) {
++		if (!n--) {
++			rcu_read_unlock();
++			return he;
++		}
++	}
++	rcu_read_unlock();
++
++	return NULL;
++}
++
++static void *fs_hentry_seq_next(struct seq_file *seq, void *v, loff_t *pos)
++{
++	struct fsguard_hentry *he = v;
++
++	rcu_read_lock();
++	he = list_next_or_null_rcu(&hentries, &he->list,
++				    struct fsguard_hentry, list);
++	rcu_read_unlock();
++	(*pos)++;
++
++	return he;
++}
++
++static void fs_hentry_seq_stop(struct seq_file *m, void *v)
++{
++}
++
++static int fs_hentry_seq_show(struct seq_file *seq, void *v)
++{
++	struct fsguard_hentry *he = v;
++	char hash[HASH_SIZE_MAX * 2 + 1];
++	
++	if (!he)
++		return -1;
++
++	bin2hex(hash, he->hash, hash_digest_size[he->alg]);
++	hash[hash_digest_size[he->alg] * 2] = '\0';
++
++	seq_printf(seq, "%s:", hash_algo_name[he->alg]);
++	seq_printf(seq, "%s:", hash);
++	seq_printf(seq, "file:%s\n", he->path);
++
++	return 0;
++}
++ 
++static const struct seq_operations fs_hentry_seq_ops = {
++	.start = fs_hentry_seq_start,
++	.next = fs_hentry_seq_next,
++	.stop = fs_hentry_seq_stop,
++	.show = fs_hentry_seq_show,
++};
++
++static int fs_hentry_open(struct inode *inode, struct file *file)
++{
++	if (file->f_flags & O_WRONLY)
++		return 0;
++	if ((file->f_flags & O_ACCMODE) != O_RDONLY)
++		return -EACCES;
++
++	return seq_open(file, &fs_hentry_seq_ops);
++}
++
++static void *fs_events_seq_start(struct seq_file *seq, loff_t *pos)
++{
++	struct fsguard_event *ev, *tmp;
++	loff_t n = *pos;
++
++	/* We need a lock here because events will be removed while read-ing */
++	mutex_lock(&evt_mtx);
++
++	list_for_each_entry_safe(ev, tmp, &events, list) {
++		if (!n--)
++			return ev;
++	}
++
++	return NULL;
++}
++
++static void event_free_rcu_cb(struct rcu_head *rcu)
++{
++	struct fsguard_event *ev = container_of(rcu, struct fsguard_event, rcu);
++
++	if (ev->path)
++		kfree(ev->path);
++
++	kfree(ev);
++}
++
++static void *fs_events_seq_next(struct seq_file *seq, void *v, loff_t *pos)
++{
++	struct fsguard_event *ev = v;
++	struct fsguard_event *next;
++
++	next = list_next_or_null_rcu(&events, &ev->list,
++				      struct fsguard_event, list);
++	(*pos)++;
++
++	list_del_rcu(&ev->list);
++	call_rcu(&ev->rcu, event_free_rcu_cb);
++
++	return next;
++}
++
++static void fs_events_seq_stop(struct seq_file *m, void *v)
++{
++	mutex_lock(&evt_mtx);
++}
++
++static int fs_events_seq_show(struct seq_file *seq, void *v)
++{
++	struct fsguard_event *ev = v;
++	
++	if (!ev)
++		return -1;
++
++	seq_printf(seq, "violated:file:%s\n", ev->path);
++	return 0;
++}
++ 
++static const struct seq_operations fs_events_seq_ops = {
++	.start = fs_events_seq_start,
++	.next = fs_events_seq_next,
++	.stop = fs_events_seq_stop,
++	.show = fs_events_seq_show,
++};
++
++static int fs_events_open(struct inode *inode, struct file *file)
++{
++	if ((file->f_flags & O_ACCMODE) != O_RDONLY)
++		return -EACCES;
++
++	return seq_open(file, &fs_events_seq_ops);
++}
++
++static int hentry_by_path_add(int alg, char *path, u8 *hash, size_t hlen)
++{
++	struct fsguard_hentry *he;
++
++	if (alg == -1) {
++		pr_err("undefined alg\n");
++		return -EINVAL;
++	}
++
++	BUG_ON(hlen == 0);
++
++	he = kzalloc(sizeof(*he), GFP_KERNEL);
++	if (!he)
++		return -ENOMEM;
++
++	he->alg  = alg;
++	he->path = path;
++	he->hash = hash;
++
++	INIT_LIST_HEAD(&he->list);
++
++	mutex_lock(&hentry_mtx);
++	list_add_tail_rcu(&he->list, &hentries);
++	mutex_unlock(&hentry_mtx);
++
++	return 0;
++}
++
++static struct fsguard_hentry *__hentry_by_path_get(const char *path)
++{
++	struct fsguard_hentry *he;
++
++	list_for_each_entry_rcu(he, &hentries, list) {
++		if (strcmp(path, he->path) == 0) {
++			return he;
++		}
++	}
++
++	return NULL;
++}
++
++static struct fsguard_hentry *hentry_by_path_get(const char *path)
++{
++	struct fsguard_hentry *he;
++
++	rcu_read_lock();
++	he = __hentry_by_path_get(path);
++	rcu_read_unlock();
++
++	return he;
++}
++
++static void hentry_free_rcu_cb(struct rcu_head *rcu)
++{
++	struct fsguard_hentry *he = container_of(rcu, struct fsguard_hentry, rcu);
++
++	if (he->path)
++		kfree(he->path);
++	if (he->hash)
++		kfree(he->hash);
++
++	kfree(he);
++}
++
++static int hentry_by_path_del(char *path)
++{
++	struct fsguard_hentry *he;
++
++	mutex_lock(&hentry_mtx);
++
++	he = __hentry_by_path_get(path);
++	if (!he) {
++		mutex_unlock(&hentry_mtx);
++		return -1;
++	}
++	list_del_rcu(&he->list);
++
++	mutex_unlock(&hentry_mtx);
++
++	call_rcu(&he->rcu, hentry_free_rcu_cb);
++	return 0;
++}
++
++/* hash entry samples:
++	add:sha1:<hash>:path:/<file path>
++	add:md5:<hash>:path:/<file path>
++	del:path:/<file path>
++*/
++static ssize_t fs_hentry_parse(char *str)
++{
++	enum hentry_token_t state = HENTRY_TOK_CMD;
++	enum hentry_cmd_t cmd = HENTRY_CMD_NONE;
++	ssize_t err = -EINVAL;
++	char *path = NULL;
++	char *hstr = NULL;
++	u8 *hash = NULL;
++	size_t hlen = 0;
++	int alg = -1;
++	char *crnl;
++	char *ptr;
++
++	while ((ptr = strsep(&str, ":")) && state != HENTRY_TOK_END) {
++		switch (state) {
++		case HENTRY_TOK_CMD:
++			if (strncmp(ptr, "add", 3) == 0) {
++				state = HENTRY_TOK_ALG;
++				cmd = HENTRY_CMD_ADD;
++			} else if (strncmp(ptr, "del", 3) == 0) {
++				state = HENTRY_TOK_PATH;
++				cmd = HENTRY_CMD_DEL;
++			} else {
++				pr_err("Invalid hash entry command\n");
++				goto out;
++			}
++			break;
++
++		case HENTRY_TOK_ALG:
++			if (strncmp(ptr, "sha1", 4) == 0)
++				alg = HASH_ALGO_SHA1;
++			else if (strncmp(ptr, "md5", 3) == 0)
++				alg = HASH_ALGO_MD5;
++
++			hlen = hash_digest_size[alg];
++			state = HENTRY_TOK_HASH;
++			break;
++
++		case HENTRY_TOK_HASH:
++			err = -ENOMEM;
++			hstr = kstrndup(ptr, (hlen * 2) + 1, GFP_KERNEL);
++			if (!hstr)
++				goto out;
++
++			err = -EINVAL;
++			if (strlen(hstr) != hlen * 2) {
++				pr_err("Invalid hash length\b");
++				goto out;
++			}
++
++			err = -ENOMEM;
++			hash = kmalloc(hlen, GFP_KERNEL);
++			if (!hash)
++				goto out;
++
++			err = -EINVAL;
++			if (hex2bin(hash, hstr, hlen)) {
++				pr_err("Invalid hash format\n");
++				goto out;
++			}
++
++			state = HENTRY_TOK_PATH;
++			break;
++
++		case HENTRY_TOK_PATH:
++			state = HENTRY_TOK_FNAME;
++			break;
++
++		case HENTRY_TOK_FNAME:
++			err = -EINVAL;
++			if (ptr[0] != '/') {
++				pr_err("Invalid path - must start with '/'\n");
++				goto out;
++			}
++
++			if (cmd == HENTRY_CMD_ADD) {
++				err = -ENOMEM;
++				path = kstrndup(ptr, NAME_MAX, GFP_KERNEL);
++				if (!path)
++					goto out;
++			} else {
++				path = ptr;
++			}
++
++			crnl = strpbrk(path, "\r\n");
++			if (crnl)
++				crnl[0] = '\0';
++
++			state = HENTRY_TOK_END;
++			break;
++
++		case HENTRY_TOK_END:
++		default:
++			BUG();
++		}
++	}
++
++	err = -EINVAL;
++	if (!path) {
++		pr_err("Invalid NULL path\n");
++		goto out;
++	}
++
++	if (cmd == HENTRY_CMD_ADD)
++		err = hentry_by_path_add(alg, path, hash, hlen);
++	else if (cmd == HENTRY_CMD_DEL)
++		err = hentry_by_path_del(path);
++	else
++		BUG();
++out:
++	if (err) {
++		if (path)
++			kfree(path);
++		if (hash)
++			kfree(hash);
++	}
++
++	if (hstr)
++		kfree(hstr);
++
++	return err;
++}
++
++static ssize_t fs_hentry_write(struct file *file, const char __user *buf,
++			       size_t len, loff_t *ppos)
++{
++	ssize_t ret = -EINVAL;
++	char *str;
++
++	if (*ppos != 0)
++		goto out;
++
++	ret = -ENOMEM;
++	str = kmalloc(len + 1, GFP_KERNEL);
++	if (!str)
++		goto out;
++
++	*(str + len) = '\0';
++
++	ret = -EFAULT;
++	if (copy_from_user(str, buf, len))
++		goto out_free;
++	
++	ret = fs_hentry_parse(str);
++	if (ret)
++		goto out;
++
++	ret = len;
++out_free:
++	kfree(str);
++out:
++	return ret;
++}
++
++static const struct file_operations fs_hentry_ops = {
++	.open = fs_hentry_open,
++	.write = fs_hentry_write,
++	.read = seq_read,
++	.llseek = generic_file_llseek,
++};
++
++static const struct file_operations fs_events_ops = {
++	.open = fs_events_open,
++	.read = seq_read,
++	.llseek = generic_file_llseek,
++};
++
++static int file_read_buf(struct file *file, loff_t offs, char *buf,
++			 unsigned long count)
++{
++	char __user *ubuf = (char __user *)buf;
++	mm_segment_t old_fs;
++	ssize_t ret;
++
++	old_fs = get_fs();
++	set_fs(get_ds());
++	ret = __vfs_read(file, ubuf, count, &offs);
++	set_fs(old_fs);
++
++	return ret;
++}
++
++static int fsguard_file_check(struct file *file, struct fsguard_hentry *he)
++{
++	const char *alg_name = hash_algo_name[he->alg];
++	struct crypto_shash *tfm = crypto_alloc_shash(alg_name, 0, 0);
++	struct inode *inode = file_inode(file);
++	loff_t i_size, offset = 0;
++	u8 hash[HASH_SIZE_MAX];
++	unsigned int hsize;
++	int rc = 0;
++	u8 *fbuf;
++	int err;
++
++	SHASH_DESC_ON_STACK(shash, tfm);
++
++	if (IS_ERR(tfm)) {
++		return 0;
++	}
++
++	shash->tfm = tfm;
++	shash->flags = 0;
++
++	err = crypto_shash_init(shash);
++	if (err) {
++		return 0;
++	}
++
++	hsize = crypto_shash_digestsize(tfm);
++
++	err = -ENOMEM;
++	fbuf = kzalloc(PAGE_SIZE, GFP_KERNEL);
++	if (!fbuf)
++		goto out;
++
++	inode_lock(inode);
++
++	i_size = i_size_read(file_inode(file));
++	if (i_size == 0)
++		goto out_unlock;
++
++	while (offset < i_size) {
++		int len;
++
++		len = file_read_buf(file, offset, fbuf, PAGE_SIZE);
++		if (len < 0) {
++			err = len;
++			break;
++		}
++		if (len == 0)
++			break;
++
++		offset += len;
++
++		err = crypto_shash_update(shash, fbuf, len);
++		if (err) {
++			break;
++		}
++	}
++
++out_unlock:
++	inode_unlock(inode);
++out:
++	if (fbuf)
++		kfree(fbuf);
++
++	if (!err) {
++		err = crypto_shash_final(shash, hash);
++		if (!err) {
++			rc = memcmp(he->hash, hash, hsize);
++		}
++	}
++
++	crypto_free_shash(tfm);
++	return rc;
++}
++
++static void fsguard_event_add(struct fsguard_hentry *he)
++{
++	struct fsguard_event *ev;
++
++	ev = kzalloc(sizeof(*ev), GFP_KERNEL);
++	if(!ev) {
++		pr_err("failed to allocate event\n");
++		return;
++	}
++
++	ev->path = kstrndup(he->path, NAME_MAX, GFP_KERNEL);
++	if (!ev->path)
++		goto err;
++
++	INIT_LIST_HEAD(&ev->list);
++
++	mutex_lock(&evt_mtx);
++	list_add_tail_rcu(&ev->list, &events);
++	mutex_unlock(&evt_mtx);
++
++	return;
++err:
++	if (ev->path)
++		kfree(ev->path);
++	kfree(ev);
++}
++
++static int fsguard_bprm_check_security(struct linux_binprm *binp)
++{
++	static struct fsguard_hentry *he;
++	char buf[NAME_MAX];
++	char *path;
++	int rc = 0;
++
++	path = d_path(&binp->file->f_path, buf, ARRAY_SIZE(buf) - 1);
++	if (IS_ERR(path))
++		return 0;
++	
++	he = hentry_by_path_get(path);
++	if (!he)
++		return 0;
++
++	rc = fsguard_file_check(binp->file, he);
++	if (rc) {
++		fsguard_event_add(he);
++		return -EACCES;
++	}
++
++	return 0;
++}
++
++static struct security_hook_list  fsguard_security_hooks[] = {
++	LSM_HOOK_INIT(bprm_check_security, fsguard_bprm_check_security),
++};
++
++int __init fsguard_init(void)
++{
++	pr_info("Initialize Filesystem Guard module\n");
++
++	fs_dir = securityfs_create_dir("fsguard", NULL);
++	if (IS_ERR(fs_dir)) {
++		pr_err("failed to add [fsguard] dir\n");
++		return -1;
++	}
++
++	fs_events = securityfs_create_file("events", S_IRUSR | S_IRGRP,
++				           fs_dir, NULL, &fs_events_ops);
++	if (IS_ERR(fs_events))
++		goto err;
++
++	fs_hentry = securityfs_create_file("hentry", S_IRUSR | S_IRGRP,
++				          fs_dir, NULL, &fs_hentry_ops);
++	if (IS_ERR(fs_hentry))
++		goto err;
++
++	security_add_hooks(fsguard_security_hooks,
++			   ARRAY_SIZE(fsguard_security_hooks));
++
++	return 0;
++err:
++	securityfs_remove(fs_events);
++	securityfs_remove(fs_hentry);
++	securityfs_remove(fs_dir);
++
++	return -1;
++}
++late_initcall(fsguard_init);
++ 
++MODULE_DESCRIPTION("File System Guard integrity module");
++MODULE_LICENSE("GPL");
+-- 
+2.7.4
+
